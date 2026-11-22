@@ -12,11 +12,11 @@ from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QFormLayout,
+    QFrame,
     QGroupBox,
     QHBoxLayout,
     QLabel,
     QLineEdit,
-    QListWidget,
     QMainWindow,
     QMessageBox,
     QPushButton,
@@ -197,16 +197,18 @@ class BreathToneWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("UX Experiment 001: Non-visual Progress Bar")
-        self.resize(560, 580)
+        self.resize(540, 420)
         os.makedirs(OUTPUT_DIR, exist_ok=True)
 
         self.lock = threading.Lock()
         self.audio: np.ndarray | None = None
+        self.active_signature: tuple | None = None
+        self.saved_signature: tuple | None = None
         self.is_playing = False
         self.play_index = 0
         self.scrubbing = False
 
-        # Independent 2-second tone preview state
+        # Independent 2-second single-tone preview state
         self.preview_audio: np.ndarray | None = None
         self.preview_index = 0
         self.preview_which: int | None = None
@@ -214,10 +216,9 @@ class BreathToneWindow(QMainWindow):
         self.stream: sd.OutputStream | None = None
 
         self._build_ui()
+        self._connect_change_listeners()
+        self._sync_filename_and_save_state()
         self._init_audio_stream()
-        self._refresh_history()
-        if self.history_list.count() > 0:
-            self._load_file(os.path.join(OUTPUT_DIR, self.history_list.item(0).text()))
 
         self.timer = QTimer(self)
         self.timer.setInterval(50)
@@ -243,24 +244,26 @@ class BreathToneWindow(QMainWindow):
         self.setCentralWidget(root)
         layout = QVBoxLayout(root)
 
-        form_box = QGroupBox("Tone Parameters (Press Enter to Generate)")
-        form_layout = QFormLayout(form_box)
+        main_box = QGroupBox("Tone Parameters (Press Enter to Play)")
+        main_layout = QVBoxLayout(main_box)
+
+        form_layout = QFormLayout()
 
         tone1_row = QHBoxLayout()
         self.tone1_input = QLineEdit("196")
-        self.test_tone1_btn = QPushButton("Test (2s)")
-        self.test_tone1_btn.setFixedWidth(85)
-        self.test_tone1_btn.clicked.connect(lambda: self._preview_tone(1))
+        self.preview_tone1_btn = QPushButton("Preview (2s)")
+        self.preview_tone1_btn.setFixedWidth(105)
+        self.preview_tone1_btn.clicked.connect(lambda: self._preview_single_tone(1))
         tone1_row.addWidget(self.tone1_input)
-        tone1_row.addWidget(self.test_tone1_btn)
+        tone1_row.addWidget(self.preview_tone1_btn)
 
         tone2_row = QHBoxLayout()
         self.tone2_input = QLineEdit("392")
-        self.test_tone2_btn = QPushButton("Test (2s)")
-        self.test_tone2_btn.setFixedWidth(85)
-        self.test_tone2_btn.clicked.connect(lambda: self._preview_tone(2))
+        self.preview_tone2_btn = QPushButton("Preview (2s)")
+        self.preview_tone2_btn.setFixedWidth(105)
+        self.preview_tone2_btn.clicked.connect(lambda: self._preview_single_tone(2))
         tone2_row.addWidget(self.tone2_input)
-        tone2_row.addWidget(self.test_tone2_btn)
+        tone2_row.addWidget(self.preview_tone2_btn)
 
         self.direction_combo = QComboBox()
         self.direction_combo.addItems(["rising", "falling"])
@@ -280,7 +283,6 @@ class BreathToneWindow(QMainWindow):
 
         self.chime_checkbox = QCheckBox("Append relaxing chime at end")
         self.chime_checkbox.setChecked(True)
-        self.generate_btn = QPushButton("Generate .WAV")
 
         form_layout.addRow("Tone 1 (Hz or Note, e.g. 196 or G3):", tone1_row)
         form_layout.addRow("Tone 2 (Hz or Note, e.g. 392 or G4):", tone2_row)
@@ -288,46 +290,93 @@ class BreathToneWindow(QMainWindow):
         form_layout.addRow("Duration (seconds, e.g. 30):", self.duration_input)
         form_layout.addRow("Hold on Target:", hold_row)
         form_layout.addRow("End Cue:", self.chime_checkbox)
-        form_layout.addRow("", self.generate_btn)
 
         for widget in (self.tone1_input, self.tone2_input, self.duration_input, self.hold_duration_input):
-            widget.returnPressed.connect(self.generate_tone)
-        self.generate_btn.clicked.connect(self.generate_tone)
-        layout.addWidget(form_box)
+            widget.returnPressed.connect(self.play_or_preview)
 
-        player_box = QGroupBox("Playback & Scrubbing")
-        player_layout = QVBoxLayout(player_box)
+        main_layout.addLayout(form_layout)
 
-        self.file_label = QLabel("No file loaded")
+        divider = QFrame()
+        divider.setFrameShape(QFrame.Shape.HLine)
+        divider.setFrameShadow(QFrame.Shadow.Sunken)
+        main_layout.addWidget(divider)
+
+        self.filename_label = QLabel("")
         self.slider = QSlider(Qt.Orientation.Horizontal)
         self.slider.setRange(0, 1000)
         self.slider.sliderPressed.connect(self._on_scrub_start)
         self.slider.sliderMoved.connect(self._on_scrub_move)
         self.slider.sliderReleased.connect(self._on_scrub_end)
 
-        btn_row = QHBoxLayout()
+        controls_row = QHBoxLayout()
         self.play_btn = QPushButton("Play")
         self.stop_btn = QPushButton("Stop")
+        self.save_btn = QPushButton("Save .WAV")
         self.time_label = QLabel("0.0s / 0.0s")
-        self.play_btn.clicked.connect(self.toggle_play)
+
+        self.play_btn.clicked.connect(self.play_or_preview)
         self.stop_btn.clicked.connect(self.stop_playback)
+        self.save_btn.clicked.connect(self.save_cue_wav)
 
-        btn_row.addWidget(self.play_btn)
-        btn_row.addWidget(self.stop_btn)
-        btn_row.addStretch()
-        btn_row.addWidget(self.time_label)
+        controls_row.addWidget(self.play_btn)
+        controls_row.addWidget(self.stop_btn)
+        controls_row.addWidget(self.save_btn)
+        controls_row.addStretch()
+        controls_row.addWidget(self.time_label)
 
-        player_layout.addWidget(self.file_label)
-        player_layout.addWidget(self.slider)
-        player_layout.addLayout(btn_row)
-        layout.addWidget(player_box)
+        main_layout.addWidget(self.filename_label)
+        main_layout.addWidget(self.slider)
+        main_layout.addLayout(controls_row)
 
-        hist_box = QGroupBox("Generated History (Double-click to load)")
-        hist_layout = QVBoxLayout(hist_box)
-        self.history_list = QListWidget()
-        self.history_list.itemDoubleClicked.connect(self._on_history_double_click)
-        hist_layout.addWidget(self.history_list)
-        layout.addWidget(hist_box)
+        layout.addWidget(main_box)
+
+    def _connect_change_listeners(self):
+        for line_edit in (
+            self.tone1_input,
+            self.tone2_input,
+            self.duration_input,
+            self.hold_duration_input,
+        ):
+            line_edit.textChanged.connect(self._sync_filename_and_save_state)
+        self.direction_combo.currentTextChanged.connect(self._sync_filename_and_save_state)
+        self.hold_checkbox.toggled.connect(self._sync_filename_and_save_state)
+        self.chime_checkbox.toggled.connect(self._sync_filename_and_save_state)
+
+    def _build_filename_and_signature(self, strict: bool = False) -> tuple[str, tuple] | None:
+        try:
+            hz1, label1 = parse_pitch(self.tone1_input.text())
+            hz2, label2 = parse_pitch(self.tone2_input.text())
+            direction = self.direction_combo.currentText()
+            duration = float(self.duration_input.text().strip())
+            if duration <= 0.1 or duration > 3600:
+                raise ValueError("Duration must be between 0.1 and 3600 seconds.")
+
+            hold_at_end = self.hold_checkbox.isChecked()
+            hold_sec = float(self.hold_duration_input.text().strip() or "0")
+            if hold_at_end and (hold_sec < 0.0 or hold_sec >= duration):
+                raise ValueError("Hold duration must be 0 or greater and less than total duration.")
+        except ValueError as err:
+            if strict:
+                QMessageBox.critical(self, "Invalid Input", str(err))
+            return None
+
+        add_chime = self.chime_checkbox.isChecked()
+        dur_label = f"{int(duration)}s" if duration.is_integer() else f"{duration}s"
+        hold_label = f"{int(hold_sec)}s" if hold_sec.is_integer() else f"{hold_sec}s"
+        hold_suffix = f"_hold{hold_label}" if (hold_at_end and hold_sec > 0) else ""
+        chime_suffix = "_chime" if add_chime else ""
+        filename = f"{label1}-{label2}_{direction}_{dur_label}{hold_suffix}{chime_suffix}.wav"
+        signature = (hz1, hz2, direction, duration, hold_at_end, hold_sec, add_chime)
+        return filename, signature
+
+    def _sync_filename_and_save_state(self):
+        parsed = self._build_filename_and_signature(strict=False)
+        if parsed is None:
+            self.save_btn.setEnabled(False)
+            return
+        filename, signature = parsed
+        self.filename_label.setText(filename)
+        self.save_btn.setEnabled(signature != self.saved_signature)
 
     def _on_hold_toggled(self, checked: bool):
         self.hold_duration_input.setEnabled(checked)
@@ -339,7 +388,7 @@ class BreathToneWindow(QMainWindow):
                 return 0.0
             return len(self.audio) / SAMPLE_RATE
 
-    def _preview_tone(self, which: int):
+    def _preview_single_tone(self, which: int):
         with self.lock:
             already_previewing_same = (
                 self.preview_audio is not None and self.preview_which == which
@@ -348,7 +397,7 @@ class BreathToneWindow(QMainWindow):
                 self.preview_audio = None
                 self.preview_index = 0
                 self.preview_which = None
-                self._sync_test_buttons(None)
+                self._sync_preview_buttons(None)
                 return
 
         raw_text = self.tone1_input.text() if which == 1 else self.tone2_input.text()
@@ -366,16 +415,15 @@ class BreathToneWindow(QMainWindow):
             self.preview_which = which
 
         self.play_btn.setText("Play")
-        self._sync_test_buttons(which)
+        self._sync_preview_buttons(which)
 
-    def _sync_test_buttons(self, active_which: int | None):
-        self.test_tone1_btn.setText("Stop" if active_which == 1 else "Test (2s)")
-        self.test_tone2_btn.setText("Stop" if active_which == 2 else "Test (2s)")
+    def _sync_preview_buttons(self, active_which: int | None):
+        self.preview_tone1_btn.setText("Stop" if active_which == 1 else "Preview (2s)")
+        self.preview_tone2_btn.setText("Stop" if active_which == 2 else "Preview (2s)")
 
     def _audio_callback(self, outdata, frames, time_info, status):
         outdata.fill(0.0)
         with self.lock:
-            # 1. Single-tone preview takes priority if active
             if self.preview_audio is not None:
                 total_len = len(self.preview_audio)
                 if self.preview_index >= total_len:
@@ -393,7 +441,6 @@ class BreathToneWindow(QMainWindow):
                     self.preview_which = None
                 return
 
-            # 2. Main generated file playback
             if not self.is_playing or self.audio is None:
                 return
             total_len = len(self.audio)
@@ -407,31 +454,12 @@ class BreathToneWindow(QMainWindow):
             if self.play_index >= total_len:
                 self.is_playing = False
 
-    def generate_tone(self):
-        try:
-            hz1, label1 = parse_pitch(self.tone1_input.text())
-            hz2, label2 = parse_pitch(self.tone2_input.text())
-            direction = self.direction_combo.currentText()
-            duration = float(self.duration_input.text().strip())
-            if duration <= 0.1 or duration > 3600:
-                raise ValueError("Duration must be between 0.1 and 3600 seconds.")
-
-            hold_at_end = self.hold_checkbox.isChecked()
-            hold_sec = float(self.hold_duration_input.text().strip() or "0")
-            if hold_at_end and (hold_sec < 0.0 or hold_sec >= duration):
-                raise ValueError("Hold duration must be 0 or greater and less than total duration.")
-        except ValueError as err:
-            QMessageBox.critical(self, "Invalid Input", str(err))
-            return
-
-        self.stop_playback()
-        add_chime = self.chime_checkbox.isChecked()
-        dur_label = f"{int(duration)}s" if duration.is_integer() else f"{duration}s"
-        hold_label = f"{int(hold_sec)}s" if hold_sec.is_integer() else f"{hold_sec}s"
-        hold_suffix = f"_hold{hold_label}" if (hold_at_end and hold_sec > 0) else ""
-        chime_suffix = "_chime" if add_chime else ""
-        filename = f"{label1}-{label2}_{direction}_{dur_label}{hold_suffix}{chime_suffix}.wav"
-        filepath = os.path.join(OUTPUT_DIR, filename)
+    def _synthesize_from_form(self) -> tuple[np.ndarray, str, tuple] | None:
+        parsed = self._build_filename_and_signature(strict=True)
+        if parsed is None:
+            return None
+        filename, signature = parsed
+        hz1, hz2, direction, duration, hold_at_end, hold_sec, add_chime = signature
 
         audio = synthesize_breath_tones(
             hz1,
@@ -443,41 +471,44 @@ class BreathToneWindow(QMainWindow):
             add_chime=add_chime,
             sample_rate=SAMPLE_RATE,
         )
-        save_wav(filepath, audio, SAMPLE_RATE)
-        self._load_file(filepath, audio)
-        self._refresh_history(select_name=filename)
+        return audio, filename, signature
 
-    def _load_file(self, filepath: str, audio: np.ndarray | None = None):
-        self.stop_playback()
-        if audio is None:
-            with wave.open(filepath, "rb") as wf:
-                frames = wf.readframes(wf.getnframes())
-                audio = np.frombuffer(frames, dtype=np.int16).astype(np.float32) / 32767.0
-        with self.lock:
-            self.audio = audio
-            self.play_index = 0
-            self.is_playing = False
-        self.file_label.setText(f"Loaded: {os.path.basename(filepath)}")
-        self.slider.setValue(0)
-        self.time_label.setText(f"0.0s / {self._duration_sec():.1f}s")
+    def play_or_preview(self):
+        result = self._synthesize_from_form()
+        if result is None:
+            return
+        audio, filename, signature = result
 
-    def toggle_play(self):
         with self.lock:
-            if self.audio is None:
-                return
             self.preview_audio = None
             self.preview_index = 0
             self.preview_which = None
 
-            if self.is_playing:
+            same_as_loaded = (
+                self.audio is not None
+                and self.active_signature == signature
+                and len(self.audio) == len(audio)
+            )
+
+            if same_as_loaded and self.is_playing:
                 self.is_playing = False
+                self._sync_preview_buttons(None)
                 self.play_btn.setText("Play")
-            else:
-                if self.play_index >= len(self.audio) - int(0.05 * SAMPLE_RATE):
-                    self.play_index = 0
-                self.is_playing = True
-                self.play_btn.setText("Pause")
-        self._sync_test_buttons(None)
+                return
+
+            if not same_as_loaded:
+                self.audio = audio
+                self.active_signature = signature
+                self.play_index = 0
+            elif self.play_index >= len(self.audio) - int(0.05 * SAMPLE_RATE):
+                self.play_index = 0
+
+            self.is_playing = True
+
+        self._sync_preview_buttons(None)
+        self.filename_label.setText(filename)
+        self.play_btn.setText("Pause")
+        self.time_label.setText(f"{self.play_index / SAMPLE_RATE:.1f}s / {self._duration_sec():.1f}s")
 
     def stop_playback(self):
         with self.lock:
@@ -488,7 +519,33 @@ class BreathToneWindow(QMainWindow):
             self.preview_which = None
         self.slider.setValue(0)
         self.play_btn.setText("Play")
-        self._sync_test_buttons(None)
+        self._sync_preview_buttons(None)
+        self.time_label.setText(f"0.0s / {self._duration_sec():.1f}s")
+
+    def save_cue_wav(self):
+        result = self._synthesize_from_form()
+        if result is None:
+            return
+        audio, filename, signature = result
+
+        filepath = os.path.join(OUTPUT_DIR, filename)
+        save_wav(filepath, audio, SAMPLE_RATE)
+
+        with self.lock:
+            self.preview_audio = None
+            self.preview_index = 0
+            self.preview_which = None
+            self.audio = audio
+            self.active_signature = signature
+            self.play_index = 0
+            self.is_playing = False
+
+        self.saved_signature = signature
+        self.save_btn.setEnabled(False)
+        self._sync_preview_buttons(None)
+        self.slider.setValue(0)
+        self.play_btn.setText("Play")
+        self.filename_label.setText(filename)
         self.time_label.setText(f"0.0s / {self._duration_sec():.1f}s")
 
     def _on_scrub_start(self):
@@ -514,13 +571,13 @@ class BreathToneWindow(QMainWindow):
         with self.lock:
             preview_which = self.preview_which
             if self.audio is None:
-                self._sync_test_buttons(preview_which)
+                self._sync_preview_buttons(preview_which)
                 return
             total_len = len(self.audio)
             idx = self.play_index
             playing = self.is_playing
 
-        self._sync_test_buttons(preview_which)
+        self._sync_preview_buttons(preview_which)
 
         total = total_len / SAMPLE_RATE
         if total <= 0:
@@ -535,29 +592,6 @@ class BreathToneWindow(QMainWindow):
             self.slider.setValue(int((pos_sec / total) * 1000))
             self.slider.blockSignals(False)
             self.time_label.setText(f"{pos_sec:.1f}s / {total:.1f}s")
-
-    def _refresh_history(self, select_name: str | None = None):
-        self.history_list.clear()
-        if not os.path.isdir(OUTPUT_DIR):
-            return
-        wavs = sorted(
-            (f for f in os.listdir(OUTPUT_DIR) if f.lower().endswith(".wav")),
-            key=lambda f: os.path.getmtime(os.path.join(OUTPUT_DIR, f)),
-            reverse=True,
-        )
-        for name in wavs:
-            self.history_list.addItem(name)
-            if select_name and name == select_name:
-                self.history_list.setCurrentRow(self.history_list.count() - 1)
-
-    def _on_history_double_click(self, item):
-        filepath = os.path.join(OUTPUT_DIR, item.text())
-        if os.path.isfile(filepath):
-            self._load_file(filepath)
-            with self.lock:
-                self.play_index = 0
-                self.is_playing = True
-            self.play_btn.setText("Pause")
 
     def closeEvent(self, event):
         with self.lock:
