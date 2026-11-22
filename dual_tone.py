@@ -59,6 +59,24 @@ def parse_pitch(raw_value: str) -> tuple[float, str]:
         return float(hz), f"{note}{octave}"
 
 
+def render_single_tone_preview(
+    hz: float,
+    duration_sec: float = 2.0,
+    sample_rate: int = SAMPLE_RATE,
+) -> np.ndarray:
+    """Synthesizes a clean single-tone preview clip with smooth fade-in/out."""
+    num_samples = max(1, int(round(sample_rate * duration_sec)))
+    t = np.linspace(0.0, duration_sec, num_samples, endpoint=False)
+    wave_data = (0.35 * np.sin(2.0 * np.pi * hz * t)).astype(np.float32)
+
+    fade_samples = min(int(0.03 * sample_rate), num_samples // 4)
+    if fade_samples > 0:
+        wave_data[:fade_samples] *= np.linspace(0.0, 1.0, fade_samples)
+        wave_data[-fade_samples:] *= np.linspace(1.0, 0.0, fade_samples)
+
+    return wave_data
+
+
 def render_relaxing_chime(
     base_hz: float,
     sample_rate: int = SAMPLE_RATE,
@@ -148,7 +166,6 @@ def synthesize_breath_tones(
 
     main_audio = (0.35 * np.sin(moving_phase) + 0.22 * np.sin(target_phase)).astype(np.float32)
 
-    # Smooth fade-in at start and fade-out at the end of the main tone cue
     fade_in_samples = min(int(0.03 * sample_rate), num_samples // 4)
     if fade_in_samples > 0:
         main_audio[:fade_in_samples] *= np.linspace(0.0, 1.0, fade_in_samples)
@@ -188,6 +205,12 @@ class BreathToneWindow(QMainWindow):
         self.is_playing = False
         self.play_index = 0
         self.scrubbing = False
+
+        # Independent 2-second tone preview state
+        self.preview_audio: np.ndarray | None = None
+        self.preview_index = 0
+        self.preview_which: int | None = None
+
         self.stream: sd.OutputStream | None = None
 
         self._build_ui()
@@ -223,8 +246,22 @@ class BreathToneWindow(QMainWindow):
         form_box = QGroupBox("Tone Parameters (Press Enter to Generate)")
         form_layout = QFormLayout(form_box)
 
+        tone1_row = QHBoxLayout()
         self.tone1_input = QLineEdit("196")
+        self.test_tone1_btn = QPushButton("Test (2s)")
+        self.test_tone1_btn.setFixedWidth(85)
+        self.test_tone1_btn.clicked.connect(lambda: self._preview_tone(1))
+        tone1_row.addWidget(self.tone1_input)
+        tone1_row.addWidget(self.test_tone1_btn)
+
+        tone2_row = QHBoxLayout()
         self.tone2_input = QLineEdit("392")
+        self.test_tone2_btn = QPushButton("Test (2s)")
+        self.test_tone2_btn.setFixedWidth(85)
+        self.test_tone2_btn.clicked.connect(lambda: self._preview_tone(2))
+        tone2_row.addWidget(self.tone2_input)
+        tone2_row.addWidget(self.test_tone2_btn)
+
         self.direction_combo = QComboBox()
         self.direction_combo.addItems(["rising", "falling"])
         self.duration_input = QLineEdit("30")
@@ -243,10 +280,10 @@ class BreathToneWindow(QMainWindow):
 
         self.chime_checkbox = QCheckBox("Append relaxing chime at end")
         self.chime_checkbox.setChecked(True)
-        self.generate_btn = QPushButton("Generate & Save .WAV")
+        self.generate_btn = QPushButton("Generate .WAV")
 
-        form_layout.addRow("Tone 1 (Hz or Note, e.g. 196 or G3):", self.tone1_input)
-        form_layout.addRow("Tone 2 (Hz or Note, e.g. 392 or G4):", self.tone2_input)
+        form_layout.addRow("Tone 1 (Hz or Note, e.g. 196 or G3):", tone1_row)
+        form_layout.addRow("Tone 2 (Hz or Note, e.g. 392 or G4):", tone2_row)
         form_layout.addRow("Direction:", self.direction_combo)
         form_layout.addRow("Duration (seconds, e.g. 30):", self.duration_input)
         form_layout.addRow("Hold on Target:", hold_row)
@@ -302,9 +339,61 @@ class BreathToneWindow(QMainWindow):
                 return 0.0
             return len(self.audio) / SAMPLE_RATE
 
+    def _preview_tone(self, which: int):
+        with self.lock:
+            already_previewing_same = (
+                self.preview_audio is not None and self.preview_which == which
+            )
+            if already_previewing_same:
+                self.preview_audio = None
+                self.preview_index = 0
+                self.preview_which = None
+                self._sync_test_buttons(None)
+                return
+
+        raw_text = self.tone1_input.text() if which == 1 else self.tone2_input.text()
+        try:
+            hz, _ = parse_pitch(raw_text)
+        except ValueError as err:
+            QMessageBox.critical(self, "Invalid Tone", str(err))
+            return
+
+        clip = render_single_tone_preview(hz, duration_sec=2.0, sample_rate=SAMPLE_RATE)
+        with self.lock:
+            self.is_playing = False
+            self.preview_audio = clip
+            self.preview_index = 0
+            self.preview_which = which
+
+        self.play_btn.setText("Play")
+        self._sync_test_buttons(which)
+
+    def _sync_test_buttons(self, active_which: int | None):
+        self.test_tone1_btn.setText("Stop" if active_which == 1 else "Test (2s)")
+        self.test_tone2_btn.setText("Stop" if active_which == 2 else "Test (2s)")
+
     def _audio_callback(self, outdata, frames, time_info, status):
         outdata.fill(0.0)
         with self.lock:
+            # 1. Single-tone preview takes priority if active
+            if self.preview_audio is not None:
+                total_len = len(self.preview_audio)
+                if self.preview_index >= total_len:
+                    self.preview_audio = None
+                    self.preview_index = 0
+                    self.preview_which = None
+                    return
+                end_idx = min(self.preview_index + frames, total_len)
+                chunk = self.preview_audio[self.preview_index:end_idx]
+                outdata[:len(chunk), 0] = chunk
+                self.preview_index = end_idx
+                if self.preview_index >= total_len:
+                    self.preview_audio = None
+                    self.preview_index = 0
+                    self.preview_which = None
+                return
+
+            # 2. Main generated file playback
             if not self.is_playing or self.audio is None:
                 return
             total_len = len(self.audio)
@@ -376,6 +465,10 @@ class BreathToneWindow(QMainWindow):
         with self.lock:
             if self.audio is None:
                 return
+            self.preview_audio = None
+            self.preview_index = 0
+            self.preview_which = None
+
             if self.is_playing:
                 self.is_playing = False
                 self.play_btn.setText("Play")
@@ -384,13 +477,18 @@ class BreathToneWindow(QMainWindow):
                     self.play_index = 0
                 self.is_playing = True
                 self.play_btn.setText("Pause")
+        self._sync_test_buttons(None)
 
     def stop_playback(self):
         with self.lock:
             self.is_playing = False
             self.play_index = 0
+            self.preview_audio = None
+            self.preview_index = 0
+            self.preview_which = None
         self.slider.setValue(0)
         self.play_btn.setText("Play")
+        self._sync_test_buttons(None)
         self.time_label.setText(f"0.0s / {self._duration_sec():.1f}s")
 
     def _on_scrub_start(self):
@@ -414,11 +512,15 @@ class BreathToneWindow(QMainWindow):
 
     def _on_tick(self):
         with self.lock:
+            preview_which = self.preview_which
             if self.audio is None:
+                self._sync_test_buttons(preview_which)
                 return
             total_len = len(self.audio)
             idx = self.play_index
             playing = self.is_playing
+
+        self._sync_test_buttons(preview_which)
 
         total = total_len / SAMPLE_RATE
         if total <= 0:
@@ -460,6 +562,7 @@ class BreathToneWindow(QMainWindow):
     def closeEvent(self, event):
         with self.lock:
             self.is_playing = False
+            self.preview_audio = None
         if self.stream is not None:
             try:
                 self.stream.stop()
